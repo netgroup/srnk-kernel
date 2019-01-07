@@ -360,6 +360,7 @@ static int seg6_genl_dumphmac(struct sk_buff *skb, struct netlink_callback *cb)
 static int __net_init seg6_net_init(struct net *net)
 {
 	struct seg6_pernet_data *sdata;
+	int err;
 
 	sdata = kzalloc(sizeof(*sdata), GFP_KERNEL);
 	if (!sdata)
@@ -375,6 +376,14 @@ static int __net_init seg6_net_init(struct net *net)
 
 	net->ipv6.seg6_data = sdata;
 
+	/* $Andrea */
+	err = seg6_local_net_init(net);
+	if (err) {
+		kfree(sdata->tun_src);
+		kfree(sdata);
+		return err;
+	}
+
 #ifdef CONFIG_IPV6_SEG6_HMAC
 	seg6_hmac_net_init(net);
 #endif
@@ -389,6 +398,9 @@ static void __net_exit seg6_net_exit(struct net *net)
 #ifdef CONFIG_IPV6_SEG6_HMAC
 	seg6_hmac_net_exit(net);
 #endif
+
+	/* $Andrea */
+	seg6_local_net_exit(net);
 
 	kfree(sdata->tun_src);
 	kfree(sdata);

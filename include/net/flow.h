@@ -91,7 +91,8 @@ struct flowi4 {
 #define fl4_ipsec_spi		uli.spi
 #define fl4_mh_type		uli.mht.type
 #define fl4_gre_key		uli.gre_key
-} __attribute__((__aligned__(BITS_PER_LONG/8)));
+}
+__attribute__((__aligned__(BITS_PER_LONG/8)));
 
 static inline void flowi4_init_output(struct flowi4 *fl4, int oif,
 				      __u32 mark, __u8 tos, __u8 scope,
@@ -125,7 +126,6 @@ static inline void flowi4_update_output(struct flowi4 *fl4, int oif, __u8 tos,
 	fl4->daddr = daddr;
 	fl4->saddr = saddr;
 }
-				      
 
 struct flowi6 {
 	struct flowi_common	__fl_common;
@@ -151,6 +151,18 @@ struct flowi6 {
 #define fl6_mh_type		uli.mht.type
 #define fl6_gre_key		uli.gre_key
 	__u32			mp_hash;
+
+	/*
+	 * This structure is filled during *_rule_match() operations as result
+	 * of the matching. Do not fill with data outside that function or it
+	 * will be overwritten.
+	 */
+	struct {
+		struct in6_addr sid;
+		__u32  table_id;
+	} seg6_local;
+#define fl6_seg6_local_sid	seg6_local.sid
+#define fl6_seg6_local_table_id	seg6_local.table_id
 } __attribute__((__aligned__(BITS_PER_LONG/8)));
 
 struct flowidn {

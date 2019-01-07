@@ -97,26 +97,36 @@ int seg6_do_srh_encap(struct sk_buff *skb, struct ipv6_sr_hdr *osrh, int proto)
 	struct ipv6hdr *hdr, *inner_hdr;
 	struct ipv6_sr_hdr *isrh;
 	int hdrlen, tot_len, err;
-
+	/* headroom for mac header. */
+	int headroom_mac_len;
+	
+	headroom_mac_len = 0;
 	hdrlen = (osrh->hdrlen + 1) << 3;
 	tot_len = hdrlen + sizeof(*hdr);
+	
+	/*  
+	 *  $Andrea
+	 *  This is a bugfix: we need to take into account mac header length 
+	 */
+	if (likely(skb_mac_header_was_set(skb)))
+		headroom_mac_len = skb->mac_len;
 
-	err = skb_cow_head(skb, tot_len);
+	err = skb_cow_head(skb, tot_len + headroom_mac_len);
 	if (unlikely(err))
 		return err;
 
 	inner_hdr = ipv6_hdr(skb);
-
+	
 	skb_push(skb, tot_len);
-	skb_reset_network_header(skb);
-	skb_mac_header_rebuild(skb);
+	skb_reset_network_header(skb);	
 	hdr = ipv6_hdr(skb);
+	
+	skb_mac_header_rebuild(skb);
 
 	/* inherit tc, flowlabel and hlim
 	 * hlim will be decremented in ip6_forward() afterwards and
 	 * decapsulation will overwrite inner hlim with outer hlim
 	 */
-
 	if (skb->protocol == htons(ETH_P_IPV6)) {
 		ip6_flow_hdr(hdr, ip6_tclass(ip6_flowinfo(inner_hdr)),
 			     ip6_flowlabel(inner_hdr));
@@ -418,7 +428,12 @@ static int seg6_build_state(struct nlattr *nla,
 
 	slwt = seg6_lwt_lwtunnel(newts);
 
-	err = dst_cache_init(&slwt->cache, GFP_KERNEL);
+	/* 
+	 * $Andrea, bug here; gfp needs to be set on GFP_ATOMIC 
+	 * because of kernel complaints about the fact that 
+	 * GFP_KERNEL may lead to sleep.
+	 */
+	err = dst_cache_init(&slwt->cache, GFP_ATOMIC);
 	if (err) {
 		kfree(newts);
 		return err;

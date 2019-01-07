@@ -20,6 +20,9 @@
 #include <linux/seg6.h>
 #include <linux/rhashtable.h>
 
+/* $Andrea */
+#include <linux/seg6_local.h>
+
 static inline void update_csum_diff4(struct sk_buff *skb, __be32 from,
 				     __be32 to)
 {
@@ -42,6 +45,13 @@ static inline void update_csum_diff16(struct sk_buff *skb, __be32 *from,
 struct seg6_pernet_data {
 	struct mutex lock;
 	struct in6_addr __rcu *tun_src;
+
+	/* 
+	 * $Andrea
+	 * Support for seg6_local operations.
+	 */
+	struct seg6_local_pernet_data seg6_local_data;
+
 #ifdef CONFIG_IPV6_SEG6_HMAC
 	struct rhashtable hmac_infos;
 #endif

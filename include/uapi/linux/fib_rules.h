@@ -57,6 +57,8 @@ enum {
 	FRA_OIFNAME,
 	FRA_PAD,
 	FRA_L3MDEV,	/* iif or oif is l3mdev goto its table */
+	/* $Andrea */
+	FRA_SEG6_LOCAL_ACTION,
 	FRA_UID_RANGE,	/* UID range */
 	__FRA_MAX
 };

@@ -23,18 +23,26 @@
 #include <net/ip6_route.h>
 #include <net/netlink.h>
 
+/* $Andrea; FIXME: #ifdef */
+#include <net/seg6.h>
+#include <linux/seg6_local.h>
+
 struct fib6_rule {
 	struct fib_rule		common;
 	struct rt6key		src;
 	struct rt6key		dst;
 	u8			tclass;
+	
+	/* $Andrea */
+	int			seg6_local_action;
 };
 
 static bool fib6_rule_matchall(const struct fib_rule *rule)
 {
 	struct fib6_rule *r = container_of(rule, struct fib6_rule, common);
 
-	if (r->dst.plen || r->src.plen || r->tclass)
+	/* $Andrea */	
+	if (r->dst.plen || r->src.plen || r->tclass || r->seg6_local_action)
 		return false;
 	return fib_rule_matchall(rule);
 }
@@ -97,6 +105,12 @@ struct dst_entry *fib6_rule_lookup(struct net *net, struct flowi6 *fl6,
 static int fib6_rule_action(struct fib_rule *rule, struct flowi *flp,
 			    int flags, struct fib_lookup_arg *arg)
 {
+	/* $Andrea */
+	struct fib6_rule *r = (struct fib6_rule *)rule;
+	int restore_context = 0;
+	void *context = NULL;
+	int seg6_local_action = 0;
+	
 	struct flowi6 *flp6 = &flp->u.ip6;
 	struct rt6_info *rt = NULL;
 	struct fib6_table *table;
@@ -123,7 +137,47 @@ static int fib6_rule_action(struct fib_rule *rule, struct flowi *flp,
 		goto discard_pkt;
 	}
 
+	/* $Andrea */	
+	if (r->seg6_local_action) {
+		seg6_local_action = r->seg6_local_action;
+		
+		/* 
+		 * We need to save the context if seg6_local_fib_rule_action()
+		 * needs to change the flp structure to perform the lookup.
+		 * We do not want to introduce side-effects if the lookup
+		 * operation fails and another low-priority rule has to be
+		 * applied; we prefer to be paranoid rather than being too clever.
+		 */
+		restore_context = seg6_local_fib_rule_save_context(
+						seg6_local_action, rule, 
+						flp, &context);
+		if (unlikely(restore_context < 0)) {
+			/* Without a context we are forced to drop the packet */
+			err = restore_context;
+			goto seg6_discard_pkt;
+		}
+		
+		err = seg6_local_fib_rule_action(seg6_local_action,
+						rule, flp, flags, NULL);
+		if (unlikely(err)) {
+			if (err == -EAGAIN)
+				goto out;	
+			
+			goto seg6_discard_pkt;
+		}
+		
+		/* We get the table_id which has been retrieved before */
+		tb_id = flp6->fl6_seg6_local_table_id;
+		goto do_lookup_table;
+
+seg6_discard_pkt:
+		rt = net->ipv6.ip6_blk_hole_entry;
+		goto discard_pkt;
+	}
+
 	tb_id = fib_rule_get_table(rule, arg);
+
+do_lookup_table:
 	table = fib6_get_table(net, tb_id);
 	if (!table) {
 		err = -EAGAIN;
@@ -132,8 +186,6 @@ static int fib6_rule_action(struct fib_rule *rule, struct flowi *flp,
 
 	rt = lookup(net, table, flp6, flags);
 	if (rt != net->ipv6.ip6_null_entry) {
-		struct fib6_rule *r = (struct fib6_rule *)rule;
-
 		/*
 		 * If we need to find a source address for this traffic,
 		 * we check the result if it meets requirement of the rule.
@@ -157,6 +209,7 @@ static int fib6_rule_action(struct fib_rule *rule, struct flowi *flp,
 		if (err != -EAGAIN)
 			goto out;
 	}
+
 again:
 	ip6_rt_put(rt);
 	err = -EAGAIN;
@@ -167,6 +220,18 @@ discard_pkt:
 	dst_hold(&rt->dst);
 out:
 	arg->result = rt;
+
+	/* 
+	 * $Andrea
+	 * If restore_context is set then we may need to free @context even 
+	 * though we do not have any error. Memory is taken and it must be
+	 * deallocated before returning, otherwise we incour in ugly memory 
+	 * leaking...
+	 */
+	if (restore_context > 0)
+		seg6_local_fib_rule_restore_context(seg6_local_action, 
+				rule, flp, &context);
+	
 	return err;
 }
 
@@ -222,12 +287,20 @@ static int fib6_rule_match(struct fib_rule *rule, struct flowi *fl, int flags)
 
 	if (r->tclass && r->tclass != ip6_tclass(fl6->flowlabel))
 		return 0;
+	
+	/* $Andrea */
+	if (r->seg6_local_action && 
+			!seg6_local_fib_rule_match(r->seg6_local_action, 
+						   rule, fl, flags))
+		return 0;
 
 	return 1;
 }
 
 static const struct nla_policy fib6_rule_policy[FRA_MAX+1] = {
 	FRA_GENERIC_POLICY,
+	/* $Andrea */
+	[FRA_SEG6_LOCAL_ACTION]	= { .type = NLA_U32 },
 };
 
 static int fib6_rule_configure(struct fib_rule *rule, struct sk_buff *skb,
@@ -238,7 +311,20 @@ static int fib6_rule_configure(struct fib_rule *rule, struct sk_buff *skb,
 	struct net *net = sock_net(skb->sk);
 	struct fib6_rule *rule6 = (struct fib6_rule *) rule;
 
-	if (rule->action == FR_ACT_TO_TBL && !rule->l3mdev) {
+	/* $Andrea */
+	if (tb[FRA_SEG6_LOCAL_ACTION]) {
+		rule6->seg6_local_action = 
+			nla_get_u32(tb[FRA_SEG6_LOCAL_ACTION]);
+
+		/* If we need to initialize some specific fields... */
+		err = seg6_local_fib_rule_config(rule6->seg6_local_action, 
+			(struct fib_rule *) rule6);
+		if (err)
+			goto errout;	
+	}
+	
+	if (rule->action == FR_ACT_TO_TBL &&
+			!rule->l3mdev && !rule6->seg6_local_action /* $Andrea */) {
 		if (rule->table == RT6_TABLE_UNSPEC)
 			goto errout;
 
@@ -253,7 +339,7 @@ static int fib6_rule_configure(struct fib_rule *rule, struct sk_buff *skb,
 
 	if (frh->dst_len)
 		rule6->dst.addr = nla_get_in6_addr(tb[FRA_DST]);
-
+	
 	rule6->src.plen = frh->src_len;
 	rule6->dst.plen = frh->dst_len;
 	rule6->tclass = frh->tos;
@@ -285,6 +371,11 @@ static int fib6_rule_compare(struct fib_rule *rule, struct fib_rule_hdr *frh,
 	if (frh->dst_len &&
 	    nla_memcmp(tb[FRA_DST], &rule6->dst.addr, sizeof(struct in6_addr)))
 		return 0;
+	
+	/* $Andrea */
+	if (tb[FRA_SEG6_LOCAL_ACTION] && 
+	    rule6->seg6_local_action != nla_get_u32(tb[FRA_SEG6_LOCAL_ACTION]))
+		return 0;
 
 	return 1;
 }
@@ -303,6 +394,12 @@ static int fib6_rule_fill(struct fib_rule *rule, struct sk_buff *skb,
 	    (rule6->src.plen &&
 	     nla_put_in6_addr(skb, FRA_SRC, &rule6->src.addr)))
 		goto nla_put_failure;
+	
+	/* $Andrea */
+	if (rule6->seg6_local_action &&
+	     nla_put_u32(skb, FRA_SEG6_LOCAL_ACTION, rule6->seg6_local_action))
+		goto nla_put_failure;
+	
 	return 0;
 
 nla_put_failure:
@@ -311,8 +408,10 @@ nla_put_failure:
 
 static size_t fib6_rule_nlmsg_payload(struct fib_rule *rule)
 {
-	return nla_total_size(16) /* dst */
-	       + nla_total_size(16); /* src */
+	return   nla_total_size(16) +	/* dst */
+		 nla_total_size(16) +	/* src */
+		 /* $Andrea */
+		 nla_total_size(4);	/* seg6_local_action */
 }
 
 static const struct fib_rules_ops __net_initconst fib6_rules_ops_template = {
